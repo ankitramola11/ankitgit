@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { FrictionType, STORAGE_KEY, emptySession, type SessionData } from '../lib/session';
+import { FrictionType, STORAGE_KEY, emptySession, normalizeSession, type SessionData } from '../lib/session';
 
 const taskTabs = ['Coding Editor', 'Writing Editor', 'Study Notes'] as const;
 type TaskTab = (typeof taskTabs)[number];
@@ -16,17 +16,24 @@ const baseContent: Record<TaskTab, string> = {
 const interventions: Record<FrictionType, { title: string; action: string }> = {
   none: { title: 'No active friction detected', action: 'Monitoring active execution signals.' },
   unclear_start: { title: 'Providing a starter structure', action: 'Seeded a minimal starting frame in editor.' },
-  overwhelm: { title: 'Breaking into first executable step', action: 'Step 1: create one line that defines immediate next action.' },
-  decision_block: { title: 'Reducing choice space', action: 'Next action constrained to a single selectable move.' },
-  difficulty_shock: { title: 'Simplifying entry point', action: 'Replaced active text with reduced-complexity example.' },
-  avoidance_loop: { title: 'Initiating micro-start (20 seconds)', action: 'Micro-start overlay engaged to force narrow initiation.' }
+  overwhelm: { title: 'Breaking into first executable step', action: 'Step 1: write one executable line only.' },
+  decision_block: { title: 'Reducing choice space', action: 'Only one allowed next action is now displayed.' },
+  difficulty_shock: { title: 'Simplifying entry point', action: 'Active material replaced with reduced-complexity form.' },
+  avoidance_loop: { title: 'Initiating micro-start (20 seconds)', action: 'Micro-start overlay is enforcing immediate initiation.' }
 };
+
+const frictionPriority: FrictionType[] = [
+  'unclear_start',
+  'avoidance_loop',
+  'difficulty_shock',
+  'decision_block',
+  'overwhelm'
+];
 
 export default function WorkspacePage() {
   const [activeTab, setActiveTab] = useState<TaskTab>('Coding Editor');
-  const [editorText, setEditorText] = useState(baseContent['Coding Editor']);
+  const [contentByTab, setContentByTab] = useState<Record<TaskTab, string>>(baseContent);
   const [session, setSession] = useState<SessionData>(emptySession);
-  const [lastInputAt, setLastInputAt] = useState<number | null>(null);
   const [overlaySeconds, setOverlaySeconds] = useState(0);
   const [injected, setInjected] = useState<Record<FrictionType, boolean>>({
     none: false,
@@ -36,13 +43,22 @@ export default function WorkspacePage() {
     difficulty_shock: false,
     avoidance_loop: false
   });
-  const previousText = useRef(editorText);
+
+  const previousText = useRef(baseContent['Coding Editor']);
+  const lastInputAtRef = useRef<number | null>(null);
+  const lastPauseLoggedAtRef = useRef(0);
+  const scrollHitsRef = useRef<number[]>([]);
+
+  const editorText = contentByTab[activeTab];
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
-      const parsed = JSON.parse(saved) as SessionData;
-      setSession(parsed);
+      try {
+        setSession(normalizeSession(JSON.parse(saved)));
+      } catch {
+        setSession(emptySession());
+      }
     }
   }, []);
 
@@ -50,22 +66,30 @@ export default function WorkspacePage() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
   }, [session]);
 
+  useEffect(() => {
+    previousText.current = editorText;
+  }, [editorText]);
+
+  const updateActiveText = (updater: (text: string) => string) => {
+    setContentByTab((current) => ({ ...current, [activeTab]: updater(current[activeTab]) }));
+  };
+
   const applyIntervention = (type: FrictionType) => {
     if (injected[type] || type === 'none') return;
 
     setInjected((current) => ({ ...current, [type]: true }));
 
     if (type === 'unclear_start') {
-      setEditorText((t) => `${t}\nStarter:\n- Objective:\n- First operation:\n`);
+      updateActiveText((t) => `${t}\nStarter:\n- Objective:\n- First operation:\n`);
     }
     if (type === 'overwhelm') {
-      setEditorText((t) => `${t}\n\nStep 1: Write one executable sentence.`);
+      updateActiveText((t) => `${t}\n\nStep 1: Write one executable sentence.`);
     }
     if (type === 'decision_block') {
-      setEditorText('Next action only:\nWrite one line that starts the task.');
+      updateActiveText(() => 'Next action only:\nWrite one line that starts the task.');
     }
     if (type === 'difficulty_shock') {
-      setEditorText('Simplified example:\nInput -> single transformation -> output.');
+      updateActiveText(() => 'Simplified example:\nInput -> single transformation -> output.');
     }
     if (type === 'avoidance_loop') {
       setOverlaySeconds(20);
@@ -73,54 +97,80 @@ export default function WorkspacePage() {
 
     setSession((current) => ({
       ...current,
-      events: [...current.events, { t: Date.now() - current.startedAt, type: 'intervention' }]
+      events: [...current.events, { t: Date.now() - current.startedAt, type: 'intervention', value: type }]
     }));
   };
 
-  useEffect(() => {
-    if (overlaySeconds <= 0) return;
-    const id = setInterval(() => setOverlaySeconds((s) => s - 1), 1000);
-    return () => clearInterval(id);
-  }, [overlaySeconds]);
+  const classifyFriction = (current: SessionData, now: number): FrictionType => {
+    const elapsed = now - current.startedAt;
+    const sinceInput = lastInputAtRef.current ? now - lastInputAtRef.current : elapsed;
+
+    const flags: Record<FrictionType, boolean> = {
+      none: false,
+      unclear_start: current.firstKeystrokeAt === null && elapsed >= 35000,
+      overwhelm: current.firstKeystrokeAt !== null && sinceInput >= 18000,
+      difficulty_shock: current.deletes >= 18,
+      avoidance_loop: current.tabSwitches > 5,
+      decision_block: scrollHitsRef.current.length >= 7
+    };
+
+    return frictionPriority.find((type) => flags[type]) ?? 'none';
+  };
 
   useEffect(() => {
     const detector = setInterval(() => {
-      setSession((current) => {
-        const now = Date.now();
-        const elapsed = now - current.startedAt;
-        const sinceInput = lastInputAt ? now - lastInputAt : elapsed;
-        let nextFriction: FrictionType = current.currentFriction;
+      const now = Date.now();
 
-        if (current.firstKeystrokeAt === null && elapsed > 35000) {
-          nextFriction = 'unclear_start';
-        } else if (current.tabSwitches > 5) {
-          nextFriction = 'avoidance_loop';
-        } else if (current.deletes >= 18) {
-          nextFriction = 'difficulty_shock';
-        } else if (current.scrolls >= 10) {
-          nextFriction = 'decision_block';
-        } else if (current.firstKeystrokeAt !== null && sinceInput > 15000) {
-          nextFriction = 'overwhelm';
+      setSession((current) => {
+        const nextFriction = classifyFriction(current, now);
+
+        const base: SessionData = {
+          ...current,
+          currentFriction: nextFriction,
+          actionDelay: current.firstKeystrokeAt ? current.firstKeystrokeAt - current.startedAt : now - current.startedAt
+        };
+
+        const pauseDuration = lastInputAtRef.current ? now - lastInputAtRef.current : 0;
+        const shouldLogPause =
+          current.firstKeystrokeAt !== null && pauseDuration >= 3000 && now - lastPauseLoggedAtRef.current >= 3000;
+
+        const withPause = shouldLogPause
+          ? {
+              ...base,
+              pauseDurations: [...base.pauseDurations, pauseDuration],
+              events: [...base.events, { t: now - base.startedAt, type: 'pause', value: Math.round(pauseDuration / 1000) }]
+            }
+          : base;
+
+        if (shouldLogPause) {
+          lastPauseLoggedAtRef.current = now;
         }
 
         if (nextFriction !== current.currentFriction) {
           setTimeout(() => applyIntervention(nextFriction), 0);
+
+          return {
+            ...withPause,
+            frictionHistory: [...withPause.frictionHistory, nextFriction],
+            events: [...withPause.events, { t: now - withPause.startedAt, type: 'friction_change', value: nextFriction }]
+          };
         }
 
-        return {
-          ...current,
-          currentFriction: nextFriction,
-          actionDelay: current.firstKeystrokeAt ? current.firstKeystrokeAt - current.startedAt : elapsed
-        };
+        return withPause;
       });
     }, 1000);
 
     return () => clearInterval(detector);
-  }, [lastInputAt, injected]);
+  }, [injected]);
+
+  useEffect(() => {
+    if (overlaySeconds <= 0) return;
+    const id = setInterval(() => setOverlaySeconds((s) => Math.max(s - 1, 0)), 1000);
+    return () => clearInterval(id);
+  }, [overlaySeconds]);
 
   const onTabSwitch = (tab: TaskTab) => {
     setActiveTab(tab);
-    setEditorText(baseContent[tab]);
     setSession((current) => ({
       ...current,
       tabSwitches: current.tabSwitches + 1,
@@ -134,17 +184,17 @@ export default function WorkspacePage() {
     const delta = next.length - prev.length;
     const deleted = delta < 0 ? Math.abs(delta) : 0;
 
-    setEditorText(next);
+    setContentByTab((current) => ({ ...current, [activeTab]: next }));
     previousText.current = next;
-    setLastInputAt(now);
+    lastInputAtRef.current = now;
 
     setSession((current) => {
-      const pause = lastInputAt ? now - lastInputAt : 0;
+      const pause = lastPauseLoggedAtRef.current === 0 ? 0 : now - lastPauseLoggedAtRef.current;
       return {
         ...current,
         firstKeystrokeAt: current.firstKeystrokeAt ?? now,
         typingBursts: [...current.typingBursts, Math.max(delta, 0)],
-        pauseDurations: pause > 1000 ? [...current.pauseDurations, pause] : current.pauseDurations,
+        pauseDurations: pause > 3000 ? [...current.pauseDurations, pause] : current.pauseDurations,
         deletes: current.deletes + deleted,
         events: [...current.events, { t: now - current.startedAt, type: deleted > 0 ? 'delete' : 'keystroke', value: Math.abs(delta) }]
       };
@@ -152,19 +202,42 @@ export default function WorkspacePage() {
   };
 
   const onScroll = () => {
+    const now = Date.now();
+    scrollHitsRef.current = [...scrollHitsRef.current.filter((t) => now - t <= 15000), now];
+
     setSession((current) => ({
       ...current,
       scrolls: current.scrolls + 1,
-      events: [...current.events, { t: Date.now() - current.startedAt, type: 'scroll', value: current.scrolls + 1 }]
+      events: [...current.events, { t: now - current.startedAt, type: 'scroll', value: scrollHitsRef.current.length }]
     }));
   };
 
+  const resetSession = () => {
+    const fresh = emptySession();
+    setSession(fresh);
+    lastInputAtRef.current = null;
+    lastPauseLoggedAtRef.current = 0;
+    scrollHitsRef.current = [];
+    setOverlaySeconds(0);
+    setInjected({
+      none: false,
+      unclear_start: false,
+      overwhelm: false,
+      decision_block: false,
+      difficulty_shock: false,
+      avoidance_loop: false
+    });
+    setContentByTab(baseContent);
+    setActiveTab('Coding Editor');
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(fresh));
+  };
+
   const typingSpeed = useMemo(() => {
-    if (!lastInputAt || !session.firstKeystrokeAt) return 0;
+    if (!session.firstKeystrokeAt || !lastInputAtRef.current) return 0;
     const totalChars = session.typingBursts.reduce((a, b) => a + b, 0);
-    const minutes = Math.max((lastInputAt - session.firstKeystrokeAt) / 60000, 1 / 60);
+    const minutes = Math.max((lastInputAtRef.current - session.firstKeystrokeAt) / 60000, 1 / 60);
     return Math.round(totalChars / minutes);
-  }, [lastInputAt, session.firstKeystrokeAt, session.typingBursts]);
+  }, [session.firstKeystrokeAt, session.typingBursts]);
 
   return (
     <main className="min-h-screen p-5 lg:p-8">
@@ -184,7 +257,15 @@ export default function WorkspacePage() {
               </button>
             ))}
           </div>
-          <Link href="/report" className="mt-6 inline-block text-xs uppercase tracking-[0.15em] text-instrument-accent underline">
+
+          <button
+            onClick={resetSession}
+            className="mt-6 w-full border border-instrument-line px-3 py-2 text-xs uppercase tracking-[0.12em] text-instrument-muted"
+          >
+            Reset Session
+          </button>
+
+          <Link href="/report" className="mt-4 inline-block text-xs uppercase tracking-[0.15em] text-instrument-accent underline">
             End Session Report
           </Link>
         </aside>
@@ -232,7 +313,7 @@ export default function WorkspacePage() {
               <Metric label="Pauses" value={`${session.pauseDurations.length}`} />
               <Metric label="Rapid deletion" value={`${session.deletes}`} />
               <Metric label="Tab switches" value={`${session.tabSwitches}`} />
-              <Metric label="Scroll loops" value={`${session.scrolls}`} />
+              <Metric label="Scroll loops" value={`${scrollHitsRef.current.length}`} />
             </div>
           </div>
         </aside>
