@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-instrument-bg text-instrument-ink antialiased;
+}
+
+.panel {
+  @apply border border-instrument-line bg-instrument-panel;
+}
